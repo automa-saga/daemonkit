@@ -1,0 +1,11 @@
+# Binaries
+*.exe
+*.test
+*.out
+# Coverage
+coverage.txt
+# Editor
+.vscode/
+.idea/
+unit-test-report.md
+cover.out

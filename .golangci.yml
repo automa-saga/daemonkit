@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# golangci-lint v2 configuration for the daemonkit module.
+#
+# Scope is intentionally narrow: only forbidigo is enabled, to enforce that
+# production code uses github.com/joomcode/errorx for error construction and
+# wrapping rather than the stdlib errors.New / fmt.Errorf. The module is small
+# and clean, so the gate lints the whole tree (no diff-scoping).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - forbidigo
+
+  settings:
+    forbidigo:
+      analyze-types: true
+      exclude-godoc-examples: true
+      forbid:
+        - pattern: '^errors\.New$'
+          msg: >-
+            daemonkit standard: use github.com/joomcode/errorx instead of
+            errors.New, e.g. errorx.IllegalState.New("...") or
+            errorx.IllegalArgument.New("...").
+        - pattern: '^fmt\.Errorf$'
+          msg: >-
+            daemonkit standard: use github.com/joomcode/errorx instead of
+            fmt.Errorf. Use errorx.<Type>.Wrap(err, "...") to add context
+            to an existing error, or errorx.<Type>.New("...") for a new
+            one.
+
+  exclusions:
+    rules:
+      # Tests are allowed to use errors.New / fmt.Errorf — error semantics
+      # in tests are local to the test and don't need rich typing.
+      - path: _test\.go
+        linters:
+          - forbidigo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

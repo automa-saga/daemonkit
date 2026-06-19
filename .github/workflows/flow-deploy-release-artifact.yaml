@@ -1,0 +1,72 @@
+name: "Deploy Release Artifact"
+on:
+  workflow_dispatch:
+    inputs:
+      go-version:
+        description: "Go Version:"
+        type: string
+        required: false
+        default: "1.26.0"
+      dry-run-enabled:
+        description: "Perform Dry Run"
+        type: boolean
+        required: false
+        default: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+jobs:
+  create-github-release:
+    name: Github / Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9 # v2.14.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Retrieve Commit Hash
+        id: commit
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "sha-abbrev=$(git rev-parse HEAD | tr -d '[:space:]' | cut -c1-8)" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup GoLang
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Install Task
+        uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
+        with:
+          version: 3.39.2
+          repo-token: ${{ github.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 20
+
+      - name: Install Semantic Release
+        run: npm install -g semantic-release@24.2.4 @semantic-release/exec@7.1.0 conventional-changelog-conventionalcommits@8.0.0
+
+      - name: Publish Semantic Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          FLAGS=""
+          if [[ "${{ inputs.dry-run-enabled }}" == "true" ]]; then
+            FLAGS="--dry-run"
+          fi
+
+          npx semantic-release ${FLAGS}

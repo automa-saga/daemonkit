@@ -1,0 +1,55 @@
+name: "ZXC: Unit Test"
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "Go Version:"
+        type: string
+        required: false
+        default: ">=1.26.0"
+      custom-job-label:
+        description: "Custom Job Label:"
+        type: string
+        required: false
+        default: "Unit Test"
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    name: "${{ inputs.custom-job-label || 'Unit Test' }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9 # v2.14.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Task
+        uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
+        with:
+          version: 3.39.2
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup GoLang
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Run Unit Tests
+        run: task test:unit
+
+      - name: Unit Test Report
+        if: ${{ always() }}
+        run: |
+          if [[ -f unit-test-report.md ]]; then
+            cat unit-test-report.md >> "${GITHUB_STEP_SUMMARY}"
+          fi
