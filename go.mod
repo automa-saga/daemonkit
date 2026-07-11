@@ -1,6 +1,6 @@
 module github.com/automa-saga/daemonkit
 
-go 1.26.0
+go 1.26.5
 
 require (
 	github.com/joomcode/errorx v1.2.0
