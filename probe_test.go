@@ -192,7 +192,10 @@ func TestSupervisedMonitor_TrackerUpdated(t *testing.T) {
 
 	tracker := NewStatusTracker()
 	done := make(chan struct{})
-	go func() { SupervisedMonitor(ctx, m, SupervisorOptions{Tracker: tracker, Logger: slog.Default()}); close(done) }()
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{Tracker: tracker, Logger: slog.Default()})
+		close(done)
+	}()
 
 	select {
 	case <-running:
