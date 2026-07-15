@@ -150,6 +150,24 @@ func Test_Log_RejectsEventWithMissingFields(t *testing.T) {
 	}
 }
 
+func Test_Log_AcceptsWarnLevel(t *testing.T) {
+	dir := t.TempDir()
+	l, err := eventlog.NewOperation(dir, "upgrade-20260415T143000Z-v0.75.0")
+	require.NoError(t, err)
+
+	// FileSkipped is a HIP-defined Warning-severity milestone: an optional
+	// artifact was skipped but the operation continued.
+	e := sampleEvent("FileSkipped")
+	e.Level = eventlog.LevelWarn
+	require.NoError(t, l.Log(e))
+	require.NoError(t, l.Close())
+
+	lines := readLines(t, l.Path())
+	require.Len(t, lines, 1)
+	assert.Equal(t, "WARN", lines[0]["level"])
+	assert.Equal(t, "FileSkipped", lines[0]["reason"])
+}
+
 func Test_Log_ConcurrentWritesProduceValidLines(t *testing.T) {
 	dir := t.TempDir()
 
