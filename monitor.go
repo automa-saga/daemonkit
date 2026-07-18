@@ -12,8 +12,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/joomcode/errorx"
 )
 
 // Back-off and degradation parameters for SupervisedMonitor. Declared as
@@ -138,10 +141,25 @@ func (t *StatusTracker) Snapshot() map[string]MonitorState {
 //   - Return nil when ctx is cancelled (clean shutdown, no restart).
 //   - Return a non-nil error only on unexpected failure (triggers supervised restart).
 //   - Be safe to call again after returning an error (the supervisor calls Run again).
+//   - Not leak unguarded goroutines: the supervisor's panic recovery covers only
+//     the Run goroutine, so any goroutine the monitor spawns must own its own
+//     recover (see Run). An unguarded panic in a spawned goroutine crashes the daemon.
 type MonitorRunner interface {
 	// Run starts the monitor and blocks until ctx is cancelled or the monitor
 	// encounters an unrecoverable error. A nil return means clean shutdown; a
 	// non-nil return triggers a supervised restart with back-off.
+	//
+	// Panic scope: SupervisedMonitor invokes Run behind a recover barrier (see
+	// safeRun), so a panic on the Run goroutine is converted into a crash and
+	// restarted with back-off rather than taking down the process. That barrier
+	// is per-goroutine and covers ONLY the goroutine executing Run. A monitor
+	// that spawns its own goroutines (go func(){…}) owns their recovery: an
+	// unguarded panic in a child goroutine unwinds independently, is NOT caught
+	// by the supervisor, and still crashes the daemon — so every goroutine a
+	// monitor starts must carry its own defer recover() (or be written so it
+	// cannot panic). The barrier also cannot catch fatal runtime errors
+	// (concurrent map writes, stack overflow, OOM, all-goroutine deadlock, cgo
+	// SIGSEGV): those are runtime.throw, not panics, and remain fatal by design.
 	Run(ctx context.Context) error
 
 	// Name returns a stable, human-readable identifier for the monitor used
@@ -195,6 +213,15 @@ type SupervisorOptions struct {
 //   - When opts.HeartbeatInterval > 0, a MonitorHeartbeat Info record is
 //     emitted on that interval while the monitor is running, so remote
 //     observability can alert on the absence of heartbeats.
+//
+// Panic recovery:
+//   - m.Run is invoked through a recover barrier (see safeRun): a panic on the
+//     Run goroutine is converted into a synthetic error and handled on the
+//     normal crash path (MonitorCrash log carrying the monitor name, the
+//     recovered value, and a stack trace, followed by back-off and restart) —
+//     a monitor panic never crashes the daemon. This covers only the Run
+//     goroutine; see MonitorRunner.Run for the goroutine-scope and
+//     fatal-runtime-error boundaries.
 //
 // This function never returns an error — it absorbs crashes and restarts the
 // monitor indefinitely until ctx is cancelled.
@@ -258,7 +285,10 @@ func SupervisedMonitor(ctx context.Context, m MonitorRunner, opts SupervisorOpti
 			}()
 		}
 
-		err := m.Run(ctx)
+		// safeRun wraps m.Run in a recover barrier so a panic on the Run
+		// goroutine becomes a crash handled below (back-off + restart) rather
+		// than an un-recovered panic that takes down the whole daemon.
+		err := safeRun(ctx, m)
 		stopHeartbeat()
 
 		// ctx cancelled → clean shutdown, do not restart.
@@ -339,4 +369,32 @@ func SupervisedMonitor(ctx context.Context, m MonitorRunner, opts SupervisorOpti
 		}
 		backoff = nextBackoff
 	}
+}
+
+// safeRun invokes m.Run(ctx) behind a panic barrier so a panicking monitor
+// becomes a supervised restart instead of a process crash. A recovered panic is
+// converted into a synthetic non-nil error carrying the monitor name, the
+// recovered value, and the stack trace captured at recover time, so it flows
+// through SupervisedMonitor's normal crash path (back-off, MonitorCrash /
+// MonitorDegraded, restart) identically to an error returned by Run. An error
+// returned by Run — or a nil return — passes through unchanged.
+//
+// Scope: recover is per-goroutine, so this barrier only covers the goroutine
+// running m.Run. A panic in a child goroutine the monitor spawns itself unwinds
+// independently and is NOT caught here — see MonitorRunner.Run. It also cannot
+// catch fatal runtime errors (concurrent map writes, stack overflow, OOM,
+// all-goroutine deadlock, cgo SIGSEGV): those are runtime.throw, not panics, and
+// terminate the process by design.
+func safeRun(ctx context.Context, m MonitorRunner) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Capture the stack now — it is unwound once this deferred function
+			// returns. Embedding it in the error means the existing MonitorCrash
+			// log ("error", err) surfaces the name, value, and stack with no
+			// change to the crash path. InternalError marks it as a bug (a panic
+			// is never expected), consistent with disk.go's use of errorx built-ins.
+			err = errorx.InternalError.New("monitor %q panicked: %v\n%s", m.Name(), r, debug.Stack())
+		}
+	}()
+	return m.Run(ctx)
 }
