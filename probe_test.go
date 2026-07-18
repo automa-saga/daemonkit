@@ -31,6 +31,10 @@ func failingProbe() Probe {
 	return &fakeLeafProbe{fn: func(_ context.Context) error { return errors.New("probe failed") }}
 }
 
+func panickingProbe() Probe {
+	return &fakeLeafProbe{fn: func(_ context.Context) error { panic("boom in probe") }}
+}
+
 func blockingProbe() Probe {
 	return &fakeLeafProbe{fn: func(ctx context.Context) error {
 		<-ctx.Done()
@@ -99,6 +103,23 @@ func TestCompositeProbe_NestedComposite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	assert.NoError(t, outer.Probe(ctx))
+}
+
+// TestCompositeProbe_RecoversPanickingProbe asserts a sub-probe that panics
+// surfaces as a probe failure from Probe (labelled, carrying the recovered value
+// and a stack) rather than crashing the daemon — the reason CompositeProbe fans
+// out through a daemonkit Group. Regression guard for that adoption.
+func TestCompositeProbe_RecoversPanickingProbe(t *testing.T) {
+	cp := NewCompositeProbe("test", succeedingProbe(), panickingProbe())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := cp.Probe(ctx)
+	if assert.Error(t, err, "a panicking sub-probe must surface as a probe failure, not a crash") {
+		assert.Contains(t, err.Error(), "test probe[", "error must label the failing sub-probe")
+		assert.Contains(t, err.Error(), "boom in probe", "error must carry the recovered value")
+		assert.Contains(t, err.Error(), "goroutine", "error must embed a stack trace")
+	}
 }
 
 // ---- BuildComponentProbe tests ----

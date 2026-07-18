@@ -649,3 +649,95 @@ func TestSupervisedMonitor_HeartbeatFiresAndCarriesHealth(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// panicConnMonitor is a ConnectivityMonitor whose ConnectivityError panics. It
+// proves the heartbeat goroutine — which calls ConnectivityError — recovers via
+// Go rather than crashing the daemon.
+type panicConnMonitor struct {
+	fakeMonitor
+}
+
+func (m *panicConnMonitor) ConnectivityError() *StatusError {
+	panic("boom in ConnectivityError")
+}
+
+// TestSupervisedMonitor_HeartbeatPanicRecovered asserts a panic raised inside the
+// heartbeat goroutine (here from a monitor's ConnectivityError) is recovered and
+// logged with reason GoroutinePanic instead of crashing the daemon — a regression
+// guard for the heartbeat being spawned via Go.
+func TestSupervisedMonitor_HeartbeatPanicRecovered(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cap := &reasonCapture{}
+	m := &panicConnMonitor{
+		fakeMonitor: fakeMonitor{
+			name: "panic-conn-monitor",
+			behavior: func(ctx context.Context, _ int) error {
+				<-ctx.Done()
+				return nil
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{
+			Logger:            slog.New(cap),
+			HeartbeatInterval: 5 * time.Millisecond,
+		})
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return cap.count("GoroutinePanic") >= 1
+	}, 2*time.Second, 5*time.Millisecond,
+		"a panic in the heartbeat must be recovered and logged, not crash the daemon")
+
+	cancel()
+	<-done // if the daemon had crashed on the heartbeat panic, we'd never reach here
+}
+
+// TestSupervisedMonitor_PanicsTripDegradation asserts consecutive panics are
+// accounted identically to consecutive returned errors: they accumulate and fire
+// MonitorDegraded (acceptance criterion: a recovered panic is just another crash).
+func TestSupervisedMonitor_PanicsTripDegradation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	origInitial := supervisedBackoffInitial
+	origThreshold := supervisedDegradedThreshold
+	supervisedBackoffInitial = 1 * time.Millisecond
+	supervisedDegradedThreshold = 3
+	t.Cleanup(func() {
+		supervisedBackoffInitial = origInitial
+		supervisedDegradedThreshold = origThreshold
+	})
+
+	cap := &reasonCapture{}
+	const wantRuns = 4
+	m := &fakeMonitor{
+		name: "panicky-monitor",
+		behavior: func(ctx context.Context, run int) error {
+			if run < wantRuns {
+				panic("boom")
+			}
+			<-ctx.Done()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{Logger: slog.New(cap)})
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return cap.count("MonitorDegraded") >= 1
+	}, 5*time.Second, 1*time.Millisecond,
+		"consecutive panics must accumulate and fire MonitorDegraded like returned errors")
+
+	cancel()
+	<-done
+}

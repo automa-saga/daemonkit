@@ -4,8 +4,7 @@ package daemonkit
 
 import (
 	"context"
-
-	"golang.org/x/sync/errgroup"
+	"fmt"
 )
 
 // Probe is the minimal leaf interface for a single prerequisite check.
@@ -40,7 +39,7 @@ type ProbableMonitor interface {
 
 // CompositeProbe implements ComponentProbe at the component boundary. It fans
 // out to a set of leaf Probe instances concurrently and returns nil only when
-// every sub-probe passes. The first failure cancels sibling probes via errgroup
+// every sub-probe passes. The first failure cancels sibling probes via group
 // context cancellation so the composite exits as fast as possible.
 //
 // Sub-probes may themselves be CompositeProbe instances — since CompositeProbe
@@ -62,15 +61,17 @@ func NewCompositeProbe(componentName string, leafProbes ...Probe) *CompositeProb
 func (c *CompositeProbe) ComponentName() string { return c.name }
 
 // Probe implements ComponentProbe (and the Probe interface). It fans out to all
-// sub-probes concurrently; the first failure cancels the rest via the errgroup
-// context.
+// sub-probes concurrently via a daemonkit Group, so a panicking sub-probe becomes
+// a probe failure rather than a daemon crash; the first failure cancels the rest
+// via the group context.
 func (c *CompositeProbe) Probe(ctx context.Context) error {
-	eg, ctx := errgroup.WithContext(ctx)
-	for _, p := range c.probes {
-		p := p // pin loop variable
-		eg.Go(func() error { return p.Probe(ctx) })
+	g, _ := WithContext(ctx)
+	for i, p := range c.probes {
+		g.Go(fmt.Sprintf("%s probe[%d]", c.name, i), func(ctx context.Context) error {
+			return p.Probe(ctx)
+		})
 	}
-	return eg.Wait()
+	return g.Wait()
 }
 
 // BuildComponentProbe collects RequiredProbe() from every ProbableMonitor in
