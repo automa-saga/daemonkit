@@ -112,6 +112,126 @@ func TestSupervisedMonitor_RestartsAfterCrash(t *testing.T) {
 	assert.GreaterOrEqual(t, int(m.runs.Load()), wantRuns)
 }
 
+// crashCapture records the "error" attribute of the first MonitorCrash record so
+// panic-recovery tests can assert the crash log carried the monitor name, the
+// recovered value, and a stack trace.
+type crashCapture struct {
+	mu       sync.Mutex
+	crashErr string
+}
+
+func (c *crashCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (c *crashCapture) WithAttrs([]slog.Attr) slog.Handler       { return c }
+func (c *crashCapture) WithGroup(string) slog.Handler            { return c }
+func (c *crashCapture) Handle(_ context.Context, r slog.Record) error {
+	var reason, errStr string
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "reason":
+			reason = a.Value.String()
+		case "error":
+			errStr = a.Value.String()
+		}
+		return true
+	})
+	if reason == "MonitorCrash" {
+		c.mu.Lock()
+		if c.crashErr == "" {
+			c.crashErr = errStr
+		}
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+func (c *crashCapture) crashError() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.crashErr
+}
+
+// TestSafeRun_RecoversPanicIntoError verifies the panic barrier in isolation: a
+// panicking Run becomes a non-nil error carrying the monitor name, the recovered
+// value, and a stack trace, while a nil return and a returned error both pass
+// through unchanged (a recovered panic must be indistinguishable from a returned
+// error to the crash path).
+func TestSafeRun_RecoversPanicIntoError(t *testing.T) {
+	t.Run("panic becomes an error with name, value, and stack", func(t *testing.T) {
+		m := &fakeMonitor{
+			name:     "boom-monitor",
+			behavior: func(context.Context, int) error { panic("kaboom") },
+		}
+		err := safeRun(context.Background(), m)
+		if assert.Error(t, err, "a panicking Run must yield a non-nil error") {
+			assert.Contains(t, err.Error(), "boom-monitor", "error must name the monitor")
+			assert.Contains(t, err.Error(), "kaboom", "error must carry the recovered value")
+			assert.Contains(t, err.Error(), "goroutine", "error must embed a stack trace")
+		}
+	})
+
+	t.Run("nil return passes through", func(t *testing.T) {
+		m := &fakeMonitor{
+			name:     "clean-monitor",
+			behavior: func(context.Context, int) error { return nil },
+		}
+		assert.NoError(t, safeRun(context.Background(), m))
+	})
+
+	t.Run("returned error passes through unchanged", func(t *testing.T) {
+		sentinel := errors.New("plain failure")
+		m := &fakeMonitor{
+			name:     "erroring-monitor",
+			behavior: func(context.Context, int) error { return sentinel },
+		}
+		assert.ErrorIs(t, safeRun(context.Background(), m), sentinel)
+	})
+}
+
+// TestSupervisedMonitor_RestartsAfterPanic asserts a monitor that panics on its
+// first Run is recovered, restarted through the normal back-off path, and reaches
+// a stable running state — proving a monitor panic never crashes the daemon. It
+// also asserts the MonitorCrash log carried the monitor name, the recovered
+// value, and a stack trace.
+func TestSupervisedMonitor_RestartsAfterPanic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	origInitial := supervisedBackoffInitial
+	supervisedBackoffInitial = 1 * time.Millisecond
+	t.Cleanup(func() { supervisedBackoffInitial = origInitial })
+
+	const wantRuns = 2
+	m := &fakeMonitor{
+		name: "panicky-monitor",
+		behavior: func(ctx context.Context, run int) error {
+			if run < wantRuns {
+				panic("boom on first run")
+			}
+			<-ctx.Done() // run 2 blocks (stable) until the test cancels
+			return nil
+		},
+	}
+
+	cap := &crashCapture{}
+	done := make(chan struct{})
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{Logger: slog.New(cap)})
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return int(m.runs.Load()) >= wantRuns
+	}, 5*time.Second, 1*time.Millisecond, "a panicking monitor must be restarted to a stable run")
+
+	cancel()
+	<-done
+
+	crashErr := cap.crashError()
+	assert.Contains(t, crashErr, "panicky-monitor", "crash log must name the monitor")
+	assert.Contains(t, crashErr, "boom on first run", "crash log must carry the recovered panic value")
+	assert.Contains(t, crashErr, "goroutine", "crash log must carry a stack trace")
+}
+
 func TestSupervisedMonitor_NoRestartOnCtxCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -525,6 +645,98 @@ func TestSupervisedMonitor_HeartbeatFiresAndCarriesHealth(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return cap.sawUnhealthy()
 	}, 2*time.Second, 5*time.Millisecond, "heartbeat should carry healthy=false once the monitor is failing")
+
+	cancel()
+	<-done
+}
+
+// panicConnMonitor is a ConnectivityMonitor whose ConnectivityError panics. It
+// proves the heartbeat goroutine — which calls ConnectivityError — recovers via
+// Go rather than crashing the daemon.
+type panicConnMonitor struct {
+	fakeMonitor
+}
+
+func (m *panicConnMonitor) ConnectivityError() *StatusError {
+	panic("boom in ConnectivityError")
+}
+
+// TestSupervisedMonitor_HeartbeatPanicRecovered asserts a panic raised inside the
+// heartbeat goroutine (here from a monitor's ConnectivityError) is recovered and
+// logged with reason GoroutinePanic instead of crashing the daemon — a regression
+// guard for the heartbeat being spawned via Go.
+func TestSupervisedMonitor_HeartbeatPanicRecovered(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cap := &reasonCapture{}
+	m := &panicConnMonitor{
+		fakeMonitor: fakeMonitor{
+			name: "panic-conn-monitor",
+			behavior: func(ctx context.Context, _ int) error {
+				<-ctx.Done()
+				return nil
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{
+			Logger:            slog.New(cap),
+			HeartbeatInterval: 5 * time.Millisecond,
+		})
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return cap.count("GoroutinePanic") >= 1
+	}, 2*time.Second, 5*time.Millisecond,
+		"a panic in the heartbeat must be recovered and logged, not crash the daemon")
+
+	cancel()
+	<-done // if the daemon had crashed on the heartbeat panic, we'd never reach here
+}
+
+// TestSupervisedMonitor_PanicsTripDegradation asserts consecutive panics are
+// accounted identically to consecutive returned errors: they accumulate and fire
+// MonitorDegraded (acceptance criterion: a recovered panic is just another crash).
+func TestSupervisedMonitor_PanicsTripDegradation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	origInitial := supervisedBackoffInitial
+	origThreshold := supervisedDegradedThreshold
+	supervisedBackoffInitial = 1 * time.Millisecond
+	supervisedDegradedThreshold = 3
+	t.Cleanup(func() {
+		supervisedBackoffInitial = origInitial
+		supervisedDegradedThreshold = origThreshold
+	})
+
+	cap := &reasonCapture{}
+	const wantRuns = 4
+	m := &fakeMonitor{
+		name: "panicky-monitor",
+		behavior: func(ctx context.Context, run int) error {
+			if run < wantRuns {
+				panic("boom")
+			}
+			<-ctx.Done()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		SupervisedMonitor(ctx, m, SupervisorOptions{Logger: slog.New(cap)})
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return cap.count("MonitorDegraded") >= 1
+	}, 5*time.Second, 1*time.Millisecond,
+		"consecutive panics must accumulate and fire MonitorDegraded like returned errors")
 
 	cancel()
 	<-done
