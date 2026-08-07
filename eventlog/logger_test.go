@@ -168,6 +168,35 @@ func Test_Log_AcceptsWarnLevel(t *testing.T) {
 	assert.Equal(t, "FileSkipped", lines[0]["reason"])
 }
 
+func Test_Log_MetadataRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	l, err := eventlog.NewOperation(dir, "upgrade-20260415T143000Z-v0.75.0")
+	require.NoError(t, err)
+
+	// Event with metadata.
+	e := sampleEvent("UpgradeScheduled")
+	e.Metadata = map[string]string{
+		"scheduled_time": "2026-04-15T15:00:00Z",
+		"artifact_hash":  "sha256:abc123",
+	}
+	require.NoError(t, l.Log(e))
+
+	// Event without metadata — field must be absent from JSON (omitempty).
+	require.NoError(t, l.Log(sampleEvent("FilesPlaced")))
+	require.NoError(t, l.Close())
+
+	lines := readLines(t, l.Path())
+	require.Len(t, lines, 2)
+
+	meta, ok := lines[0]["metadata"].(map[string]any)
+	require.True(t, ok, "metadata must be a JSON object")
+	assert.Equal(t, "2026-04-15T15:00:00Z", meta["scheduled_time"])
+	assert.Equal(t, "sha256:abc123", meta["artifact_hash"])
+
+	_, hasMetadata := lines[1]["metadata"]
+	assert.False(t, hasMetadata, "nil metadata must be omitted from JSON")
+}
+
 func Test_Log_ConcurrentWritesProduceValidLines(t *testing.T) {
 	dir := t.TempDir()
 

@@ -23,14 +23,17 @@ const (
 )
 
 // Event is a single lifecycle milestone written to a JSONL file.
-// All fields are required; Log rejects an Event with any zero value.
+// All fields except Metadata are required; Log rejects an Event with any
+// required zero value. Metadata carries optional structured key-value pairs
+// that do not fit the fixed schema (e.g. scheduled_time, artifact_hash).
 type Event struct {
-	Ts          time.Time `json:"ts"`
-	Level       Level     `json:"level"`
-	Reason      string    `json:"reason"`
-	Msg         string    `json:"msg"`
-	OperationID string    `json:"operationId"`
-	NodeID      string    `json:"nodeId"`
+	Ts          time.Time         `json:"ts"`
+	Level       Level             `json:"level"`
+	Reason      string            `json:"reason"`
+	Msg         string            `json:"msg"`
+	OperationID string            `json:"operationId"`
+	NodeID      string            `json:"nodeId"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 func (e Event) validate() error {
